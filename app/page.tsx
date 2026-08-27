@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  AudioPresets,
   LocalVideoTrack,
   Room,
   RoomEvent,
@@ -149,6 +150,8 @@ export default function Home() {
   const [roomLimit, setRoomLimit] = useState(8);
   const [presetId, setPresetId] = useState("balanced");
   const [shareAudio, setShareAudio] = useState(false);
+  const [publishedAudio, setPublishedAudio] = useState(false);
+  const [audioBlocked, setAudioBlocked] = useState(false);
   const [localScreenTrack, setLocalScreenTrack] = useState<LocalVideoTrack | null>(null);
   const [remoteMedia, setRemoteMedia] = useState<RemoteMedia[]>([]);
   const [participants, setParticipants] = useState<ParticipantView[]>([]);
@@ -229,6 +232,7 @@ export default function Home() {
 
       const currentRoom = new Room({ adaptiveStream: false, dynacast: true });
       currentRoom.on(RoomEvent.ConnectionStateChanged, (state) => setStatus(state.toLowerCase()));
+      currentRoom.on(RoomEvent.AudioPlaybackStatusChanged, (playing) => setAudioBlocked(!playing));
       currentRoom.on(RoomEvent.ParticipantConnected, () => syncParticipants(currentRoom));
       currentRoom.on(RoomEvent.ParticipantDisconnected, () => syncParticipants(currentRoom));
       currentRoom.on(RoomEvent.ParticipantNameChanged, () => syncParticipants(currentRoom));
@@ -252,6 +256,11 @@ export default function Home() {
           setStreamStats(null);
           setNotice("");
         }
+        if (publication.source === Track.Source.ScreenShareAudio) setPublishedAudio(false);
+        syncParticipants(currentRoom);
+      });
+      currentRoom.on(RoomEvent.LocalTrackPublished, (publication) => {
+        if (publication.source === Track.Source.ScreenShareAudio) setPublishedAudio(true);
         syncParticipants(currentRoom);
       });
 
@@ -264,6 +273,12 @@ export default function Home() {
       setRoomLimit(Number(data.maxParticipants || maxParticipants));
       setStatus("connected");
       syncParticipants(currentRoom);
+      try {
+        await currentRoom.startAudio();
+        setAudioBlocked(!currentRoom.canPlaybackAudio);
+      } catch {
+        setAudioBlocked(true);
+      }
       localStorage.setItem(SESSION_KEY, JSON.stringify({
         roomId: targetRoom,
         name: username,
@@ -314,6 +329,16 @@ export default function Home() {
       // A sessão continuará ativa mesmo se o armazenamento estiver indisponível.
     }
   }, [presetId, roomId]);
+
+  useEffect(() => {
+    if (!remoteAudios.length || !roomRef.current) return;
+    const timer = window.setTimeout(() => {
+      void roomRef.current?.startAudio()
+        .then(() => setAudioBlocked(!roomRef.current?.canPlaybackAudio))
+        .catch(() => setAudioBlocked(true));
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [remoteAudios.length]);
 
   useEffect(() => {
     if (!localScreenTrack) {
@@ -383,16 +408,26 @@ export default function Home() {
       const publication = await currentRoom.localParticipant.setScreenShareEnabled(
         true,
         {
-          audio: shareAudio,
+          audio: shareAudio ? {
+            autoGainControl: false,
+            echoCancellation: false,
+            noiseSuppression: false,
+            channelCount: 2,
+          } : false,
           video: true,
           resolution: { width: preset.width, height: preset.height, frameRate: preset.fps },
           contentHint: preset.hint,
           selfBrowserSurface: "exclude",
           surfaceSwitching: "include",
           systemAudio: shareAudio ? "include" : "exclude",
+          preferCurrentTab: shareAudio,
+          suppressLocalAudioPlayback: false,
         },
         {
           source: Track.Source.ScreenShare,
+          audioPreset: AudioPresets.musicHighQualityStereo,
+          forceStereo: shareAudio,
+          dtx: false,
           simulcast: true,
           degradationPreference: preset.degradation,
           screenShareEncoding: {
@@ -419,6 +454,7 @@ export default function Home() {
       setLocalScreenTrack(videoTrack);
       syncParticipants(currentRoom);
       const audioPublished = Boolean(currentRoom.localParticipant.getTrackPublication(Track.Source.ScreenShareAudio));
+      setPublishedAudio(audioPublished);
       setNotice(
         `Transmitindo em ${preset.resolution} · até ${preset.fps} FPS${audioPublished ? " · áudio ativo" : shareAudio ? " · fonte sem áudio disponível" : ""}.`,
       );
@@ -430,6 +466,7 @@ export default function Home() {
   async function stopScreen() {
     await roomRef.current?.localParticipant.setScreenShareEnabled(false);
     setLocalScreenTrack(null);
+    setPublishedAudio(false);
     setStreamStats(null);
     setNotice("");
     if (roomRef.current) syncParticipants(roomRef.current);
@@ -443,6 +480,7 @@ export default function Home() {
     setRemoteMedia([]);
     setParticipants([]);
     setLocalScreenTrack(null);
+    setPublishedAudio(false);
     setRoomId(null);
     setStatus("disconnected");
     setTheater(false);
@@ -464,6 +502,18 @@ export default function Home() {
       }
     } catch {
       setError("Picture-in-Picture não é permitido por este navegador para esta transmissão.");
+    }
+  }
+
+  async function enableAudioPlayback() {
+    if (!roomRef.current) return;
+    try {
+      await roomRef.current.startAudio();
+      setAudioBlocked(!roomRef.current.canPlaybackAudio);
+      if (roomRef.current.canPlaybackAudio) setNotice("Reprodução de áudio liberada neste dispositivo.");
+    } catch {
+      setError("O navegador ainda bloqueou o som. Toque novamente após interagir com a página.");
+      setAudioBlocked(true);
     }
   }
 
@@ -546,6 +596,7 @@ export default function Home() {
               : screenCount ? "recebendo transmissões da sala" : "nenhuma transmissão ativa"}</div>
           </div>
           <div className="view-controls">
+            {remoteAudios.length > 0 && <button className={`view-button ${audioBlocked ? "sound-required" : "active"}`} onClick={enableAudioPlayback}>{audioBlocked ? "🔊 Ativar som" : "🔊 Som ativo"}</button>}
             <button className="view-button" onClick={togglePictureInPicture} disabled={!screenCount}>▱ Picture-in-Picture</button>
             <button className="view-button" onClick={toggleFullscreen} disabled={!screenCount}>⛶ Tela cheia</button>
             <button className={`view-button ${theater ? "active" : ""}`} onClick={() => setTheater((current) => !current)}>▰ Modo teatro</button>
@@ -566,6 +617,8 @@ export default function Home() {
           <p className="muted panel-intro">Os presets agora alteram captura, FPS e limite real de bitrate.</p>
           <div className="preset-list">{PRESETS.map((item) => <button key={item.id} className={`preset ${presetId === item.id ? "selected" : ""}`} onClick={() => setPresetId(item.id)} disabled={Boolean(localScreenTrack)}><span className="radio">{presetId === item.id ? "●" : "○"}</span><span className="preset-text"><strong>{item.name}</strong><small>{item.description}</small><span className="preset-spec">{item.resolution} · {item.fps} FPS · até {item.bitrate} Mbps</span><small>{item.load}</small></span></button>)}</div>
           <label className="toggle-row"><span><strong>Compartilhar áudio</strong><small>Áudio da aba ou do sistema, quando disponível</small></span><input type="checkbox" checked={shareAudio} onChange={(event) => setShareAudio(event.target.checked)} disabled={Boolean(localScreenTrack)} /></label>
+          {shareAudio && !localScreenTrack && <p className="audio-capture-hint">Na janela de compartilhamento, escolha uma aba com áudio ou marque “Compartilhar também o áudio do sistema”. Janelas isoladas geralmente não fornecem som.</p>}
+          {localScreenTrack && <div className={`audio-publish-status ${publishedAudio ? "active" : "missing"}`}><span>{publishedAudio ? "●" : "!"}</span><div><strong>{publishedAudio ? "Áudio sendo transmitido" : "A fonte não forneceu áudio"}</strong><small>{publishedAudio ? "Os demais participantes recebem uma faixa estéreo separada." : "Pare a tela e compartilhe novamente escolhendo uma aba ou tela com a opção de áudio marcada."}</small></div></div>}
           {streamStats && <div className="quality-live"><span className="status-dot" /><div><strong>Qualidade efetiva</strong><small>{streamStats.width}×{streamStats.height} · {streamStats.fps} FPS · {streamStats.bitrate.toFixed(1)} Mbps{streamStats.limitation && streamStats.limitation !== "none" ? ` · limite: ${streamStats.limitation}` : ""}</small></div></div>}
           <div className="participants-heading"><span>Participantes</span><strong>{participants.length}/{roomLimit}</strong></div>
           <div className="participants-list">{participants.map((participant) => <div className="participant-box" key={participant.identity}><div><span className="avatar">{participant.name[0]?.toUpperCase() || "?"}</span><span><strong>{participant.name}</strong><small>{participant.sharing ? "Compartilhando tela" : "Na sala"}</small></span></div><span className={participant.sharing ? "sharing-label" : "you-label"}>{participant.local ? "você" : participant.sharing ? "ao vivo" : "online"}</span></div>)}</div>
